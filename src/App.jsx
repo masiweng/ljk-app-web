@@ -88,9 +88,9 @@ export default function App() {
   const [previewUrl, setPreviewUrl] = useState(null);
 
   // Filter Settings
-  const [filterMode, setFilterMode] = useState("magic"); // 'magic' (Auto) or 'manual'
+  const [filterMode, setFilterMode] = useState("magic");
   const [filters, setFilters] = useState({
-    threshold: 110, // Untuk mode manual
+    threshold: 110,
     brightness: 10,
     contrast: 20,
   });
@@ -100,7 +100,7 @@ export default function App() {
   const [anchorTopLeft, setAnchorTopLeft] = useState(null);
 
   const canvasRef = useRef(null);
-  const blurCanvasRef = useRef(null); // Canvas helper untuk Magic Filter
+  const blurCanvasRef = useRef(null);
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const trackRef = useRef(null);
@@ -130,16 +130,10 @@ export default function App() {
 
   // --- IMAGE PROCESSING ENGINE ---
 
-  // 1. Magic Enhance (Adaptive Thresholding)
-  // Teknik ini meniru Scanner: Membandingkan pixel dengan rata-rata area sekitarnya (blur)
-  // untuk menghilangkan bayangan dan menonjolkan tinta.
   const applyMagicFilter = (ctx, width, height) => {
-    // Ambil data asli
     const imgData = ctx.getImageData(0, 0, width, height);
     const src = imgData.data;
 
-    // Buat versi blur untuk estimasi background
-    // Kita pakai canvas terpisah/offscreen biar cepat (GPU accelerated blur)
     let blurCtx = blurCanvasRef.current?.getContext("2d");
     if (!blurCanvasRef.current) {
       const c = document.createElement("canvas");
@@ -152,31 +146,23 @@ export default function App() {
       blurCanvasRef.current.height = height;
     }
 
-    blurCtx.filter = "blur(20px)"; // Radius blur cukup besar untuk cover bayangan
+    blurCtx.filter = "blur(20px)";
     blurCtx.drawImage(ctx.canvas, 0, 0);
     const blurData = blurCtx.getImageData(0, 0, width, height).data;
 
-    // Proses Adaptive Threshold
-    // Jika Pixel < (Background - Sensitivity) maka HITAM, else PUTIH
-    const sensitivity = 30; // Semakin besar, semakin sedikit noise, tapi tinta tipis mungkin hilang
+    const sensitivity = 30;
 
     for (let i = 0; i < src.length; i += 4) {
-      // Ambil luminance (hitam putih)
       const gray = (src[i] + src[i + 1] + src[i + 2]) / 3;
       const bg = (blurData[i] + blurData[i + 1] + blurData[i + 2]) / 3;
-
       const val = gray < bg - sensitivity ? 0 : 255;
-
       src[i] = val;
       src[i + 1] = val;
       src[i + 2] = val;
-      // src[i+3] alpha tetap 255
     }
-
     ctx.putImageData(imgData, 0, 0);
   };
 
-  // 2. Manual Filter (Global Threshold)
   const applyManualFilter = (ctx, width, height) => {
     const imageData = ctx.getImageData(0, 0, width, height);
     const data = imageData.data;
@@ -191,21 +177,21 @@ export default function App() {
     ctx.putImageData(imageData, 0, 0);
   };
 
-  // --- DETECTION LOGIC ---
+  // --- DETECTION LOGIC (IMPROVED) ---
 
   const analyzeImage = useCallback((ctx, width, height) => {
     const imageData = ctx.getImageData(0, 0, width, height);
     const data = imageData.data;
 
-    // Find Timing Marks (Left Margin)
-    const scanX = Math.floor(width * 0.03); // 3% from left
+    // Scan margin kiri (3% dari kiri)
+    const scanX = Math.floor(width * 0.03);
     let marks = [];
     let inMark = false;
     let markStart = 0;
 
     for (let y = 0; y < height; y++) {
       const idx = (y * width + scanX) * 4;
-      const isBlack = data[idx] === 0; // Data sudah biner (0 atau 255)
+      const isBlack = data[idx] === 0;
 
       if (isBlack) {
         if (!inMark) {
@@ -216,15 +202,23 @@ export default function App() {
         if (inMark) {
           inMark = false;
           const h = y - markStart;
-          // Toleransi tinggi mark
-          if (h > height * 0.003 && h < height * 0.05) {
+          // FILTER 1: Validasi Tinggi
+          // Min 0.3% (untuk ignore noise)
+          // Max 2.5% (PENTING: Kotak Anchor biasanya > 3%, jadi ini akan memfilter kotak bawah)
+          if (h > height * 0.003 && h < height * 0.025) {
             marks.push(markStart + h / 2);
           }
         }
       }
     }
 
-    const validMarks = marks.filter((y) => y > height * 0.55);
+    // FILTER 2: Validasi Posisi Y
+    // Ambil tanda yang ada di area jawaban (55% - 89% tinggi kertas)
+    // Batas 89% ini penting agar kotak anchor di posisi 90-95% tidak terambil
+    const validMarks = marks.filter(
+      (y) => y > height * 0.55 && y < height * 0.89
+    );
+
     return { validMarks };
   }, []);
 
@@ -329,21 +323,22 @@ export default function App() {
     canvas.width = originalImage.width;
     canvas.height = originalImage.height;
 
-    // 1. Draw Original
     ctx.drawImage(originalImage, 0, 0);
 
-    // 2. Apply Filter (Magic or Manual)
     if (filterMode === "magic") {
       applyMagicFilter(ctx, canvas.width, canvas.height);
     } else {
       applyManualFilter(ctx, canvas.width, canvas.height);
     }
 
-    // 3. Detect
     const { validMarks } = analyzeImage(ctx, canvas.width, canvas.height);
 
+    // FILTER 3: Smart Selection (Ambil 10 baris paling masuk akal)
     let rowsY = [];
     if (validMarks.length >= 10) {
+      // Jika terdeteksi lebih dari 10, kita harus hati-hati.
+      // Ambil 10 baris terakhir, TAPI karena kita sudah filter area bawah (<89%),
+      // seharusnya aman.
       rowsY = validMarks.slice(-10);
       setCameraFeedback("Mode Dinamis: OK");
     } else {
@@ -354,14 +349,13 @@ export default function App() {
     }
     setDetectedRows(rowsY);
 
-    // 4. Debug Overlay
     if (showDebugOverlay) {
       const w = canvas.width;
       rowsY.forEach((y, i) => {
         ctx.beginPath();
         ctx.moveTo(0, y);
         ctx.lineTo(w, y);
-        ctx.strokeStyle = validMarks.length >= 10 ? "#00ff00" : "#ff0000"; // Hijau = Sukses Enhance
+        ctx.strokeStyle = validMarks.length >= 10 ? "#00ff00" : "#ff0000";
         ctx.lineWidth = validMarks.length >= 10 ? 4 : 2;
         ctx.stroke();
       });
@@ -389,14 +383,14 @@ export default function App() {
     setIsProcessing(true);
     setProcessingStep("Analisis Jawaban...");
 
-    // Gunakan hasil canvas yang SUDAH di-filter (Magic/Manual)
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
     const w = canvas.width;
 
     const answers = {};
     let yCoords = detectedRows;
-    // Fallback koordinat jika gagal total
+
+    // Double check saat proses final
     if (yCoords.length < 10) {
       const startY = canvas.height * 0.805;
       yCoords = Array.from(
@@ -404,6 +398,7 @@ export default function App() {
         (_, i) => startY + i * (canvas.height * 0.0165)
       );
     } else {
+      // Pastikan kita pakai 10 baris terbawah dari hasil filter yang ketat
       yCoords = yCoords.slice(-10);
     }
 
@@ -433,10 +428,6 @@ export default function App() {
     setStudentAnswers(answers);
 
     setProcessingStep("OCR Nama...");
-    // OCR Sederhana (Opsional, seringkali lebih baik manual jika tulisan jelek)
-    // Kita skip OCR otomatis di sini agar cepat, user bisa input nama manual
-    // atau kita bisa enable jika Tesseract ready
-
     setTimeout(() => {
       setIsProcessing(false);
       setScanStage("result");
