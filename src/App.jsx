@@ -30,6 +30,7 @@ import {
   ZoomIn,
   Wand2,
   SlidersHorizontal,
+  MousePointerClick,
 } from "lucide-react";
 
 // --- TESSERACT LOADER ---
@@ -70,6 +71,9 @@ export default function App() {
   const [studentName, setStudentName] = useState("");
   const [studentAnswers, setStudentAnswers] = useState({});
 
+  // State baru untuk menyimpan lokasi koordinat bulatan agar bisa diklik
+  const [bubbleLocations, setBubbleLocations] = useState([]);
+
   const [mode, setMode] = useState("scan");
   const [scanStage, setScanStage] = useState("capture");
   const [isProcessing, setIsProcessing] = useState(false);
@@ -106,6 +110,7 @@ export default function App() {
   const trackRef = useRef(null);
   const scanIntervalRef = useRef(null);
   const uploadInputRef = useRef(null);
+  const resultCanvasRef = useRef(null); // Canvas khusus untuk interaksi hasil
 
   // Persistence
   useEffect(() => {
@@ -177,38 +182,27 @@ export default function App() {
     ctx.putImageData(imageData, 0, 0);
   };
 
-  // --- DETECTION LOGIC (SMART SEQUENCE) ---
+  // --- DETECTION LOGIC ---
 
-  // Helper: Cari sequence 10 baris yang jaraknya paling konsisten
   const findBestRowSequence = (marks) => {
     if (marks.length < 10) return [];
     if (marks.length === 10) return marks;
-
     let bestSequence = [];
     let minVariance = Infinity;
-
-    // Sliding window: Coba ambil 10 item dari index 0, lalu index 1, dst.
-    // Tujuannya mencari mana yang jarak antar barisnya paling "sama"
     for (let i = 0; i <= marks.length - 10; i++) {
       const sequence = marks.slice(i, i + 10);
-
-      // Hitung jarak antar baris dalam sequence ini
       let gaps = [];
       for (let j = 0; j < sequence.length - 1; j++) {
         gaps.push(sequence[j + 1] - sequence[j]);
       }
-
-      // Hitung Variance (Ketidakteraturan jarak)
       const avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
       const variance =
         gaps.reduce((a, b) => a + Math.pow(b - avgGap, 2), 0) / gaps.length;
-
       if (variance < minVariance) {
         minVariance = variance;
         bestSequence = sequence;
       }
     }
-
     return bestSequence;
   };
 
@@ -216,8 +210,6 @@ export default function App() {
     const imageData = ctx.getImageData(0, 0, width, height);
     const data = imageData.data;
 
-    // Scan margin kiri (Geser sedikit ke 3.5% - 4% karena kadang foto miring)
-    // Kita coba scan beberapa garis vertikal untuk memastikan ketemu
     const scanXCandidates = [width * 0.025, width * 0.035, width * 0.045];
     let bestMarks = [];
 
@@ -240,33 +232,22 @@ export default function App() {
           if (inMark) {
             inMark = false;
             const h = y - markStart;
-            // Strict Filter Tinggi:
-            // Minimal 0.2% (biar noise titik hilang)
-            // Maksimal 2.0% (PENTING: Kotak anchor bawah biasanya tebal > 2.5%, jadi ini filter kuncinya)
             if (h > height * 0.002 && h < height * 0.022) {
               marks.push(markStart + h / 2);
             }
           }
         }
       }
-
-      // Filter Area Y: Hanya ambil paruh bawah (Jawaban)
-      // Kita longgarkan sedikit batas bawah (0.92) tapi andalkan logika Sequence untuk membuang anchor
       const candidates = marks.filter(
         (y) => y > height * 0.5 && y < height * 0.92
       );
-
       if (candidates.length >= 10) {
-        // Jika scan line ini menemukan cukup kandidat, gunakan ini
         if (candidates.length > bestMarks.length) {
           bestMarks = candidates;
         }
       }
     }
-
-    // SMART SEQUENCE: Pilih 10 baris terbaik dari kandidat
     const finalRows = findBestRowSequence(bestMarks);
-
     return { validMarks: finalRows, rawCount: bestMarks.length };
   }, []);
 
@@ -291,7 +272,6 @@ export default function App() {
         };
       }
       streamRef.current = stream;
-
       const track = stream.getVideoTracks()[0];
       trackRef.current = track;
       const caps = track.getCapabilities();
@@ -360,17 +340,15 @@ export default function App() {
     }
   };
 
-  // --- PREVIEW & EDITOR ---
+  // --- PREVIEW LOGIC ---
 
   const updatePreviewAndDetect = useCallback(() => {
     if (!originalImage || !canvasRef.current) return;
 
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
-
     canvas.width = originalImage.width;
     canvas.height = originalImage.height;
-
     ctx.drawImage(originalImage, 0, 0);
 
     if (filterMode === "magic") {
@@ -379,21 +357,16 @@ export default function App() {
       applyManualFilter(ctx, canvas.width, canvas.height);
     }
 
-    const { validMarks, rawCount } = analyzeImage(
-      ctx,
-      canvas.width,
-      canvas.height
-    );
+    const { validMarks } = analyzeImage(ctx, canvas.width, canvas.height);
 
     let rowsY = [];
     if (validMarks.length === 10) {
       rowsY = validMarks;
       setCameraFeedback("Mode Dinamis: OK");
     } else {
-      setCameraFeedback("Mode Statis (Gagal Deteksi)");
-      // Fallback Statis (Diset mendekati layout LJK rev3)
-      const startY = canvas.height * 0.58; // Mulai agak tengah
-      const stepY = canvas.height * 0.033; // Jarak antar baris lebih lebar
+      setCameraFeedback("Mode Statis");
+      const startY = canvas.height * 0.58;
+      const stepY = canvas.height * 0.033;
       rowsY = Array.from({ length: 10 }, (_, i) => startY + i * stepY);
     }
     setDetectedRows(rowsY);
@@ -407,8 +380,6 @@ export default function App() {
         ctx.strokeStyle = validMarks.length === 10 ? "#00ff00" : "#ff0000";
         ctx.lineWidth = validMarks.length === 10 ? 4 : 2;
         ctx.stroke();
-
-        // Tulis nomor baris untuk debug
         ctx.fillStyle = validMarks.length === 10 ? "#00ff00" : "#ff0000";
         ctx.font = "bold 20px sans-serif";
         ctx.fillText((i + 1).toString(), 10, y - 5);
@@ -421,7 +392,7 @@ export default function App() {
     updatePreviewAndDetect();
   }, [updatePreviewAndDetect]);
 
-  // --- SCAN PROCESS ---
+  // --- SCAN & INTERACTIVE MAP BUILDER ---
 
   const getDarkness = (ctx, x, y, radius) => {
     if (x < 0 || y < 0) return 0;
@@ -442,10 +413,8 @@ export default function App() {
     const w = canvas.width;
 
     const answers = {};
-    // Gunakan detectedRows yang sudah disaring oleh "Smart Sequence"
     let yCoords = detectedRows;
 
-    // Fallback Akhir jika array kosong/tidak valid
     if (yCoords.length !== 10) {
       const startY = canvas.height * 0.58;
       yCoords = Array.from(
@@ -454,10 +423,12 @@ export default function App() {
       );
     }
 
-    // Koordinat X Kolom (LJK Rev3 sepertinya agak geser)
-    // Kita sesuaikan X ini:
     const colX = [0.04, 0.235, 0.43, 0.625, 0.82];
     const optGap = w * 0.028;
+    const bubbleRadius = w * 0.009; // Radius hit area
+
+    // Kita simpan koordinat SEMUA bulatan untuk interaksi klik nanti
+    let detectedBubblesMap = [];
 
     colX.forEach((cx, cIdx) => {
       const startQ = cIdx * 10 + 1;
@@ -470,8 +441,17 @@ export default function App() {
 
         ["A", "B", "C", "D", "E"].forEach((opt, oIdx) => {
           const x = baseX + 25 + oIdx * optGap;
-          const dark = getDarkness(ctx, x, y, w * 0.006);
-          // Threshold isian 40% biar tidak false positive
+          const dark = getDarkness(ctx, x, y, w * 0.006); // Scan area slightly smaller
+
+          // Simpan lokasi untuk visual editor
+          detectedBubblesMap.push({
+            q: qNum,
+            opt: opt,
+            x: x,
+            y: y,
+            r: bubbleRadius,
+          });
+
           if (dark > 40 && dark > maxD) {
             maxD = dark;
             best = opt;
@@ -480,14 +460,112 @@ export default function App() {
         if (best) answers[qNum] = best;
       }
     });
+
+    setBubbleLocations(detectedBubblesMap);
     setStudentAnswers(answers);
 
     setProcessingStep("OCR Nama...");
+    // Skip OCR for speed in this step, user can edit manual
     setTimeout(() => {
       setIsProcessing(false);
       setScanStage("result");
     }, 500);
   };
+
+  // --- RESULT INTERACTION HANDLERS ---
+
+  // Fungsi menggambar ulang canvas hasil (Image Asli + Lingkaran Merah)
+  const drawResultCanvas = useCallback(() => {
+    if (!resultCanvasRef.current || !originalImage) return;
+    const canvas = resultCanvasRef.current;
+    const ctx = canvas.getContext("2d");
+
+    // 1. Gambar foto asli (TANPA FILTER B&W, BIAR USER LIHAT FOTO ASLI)
+    canvas.width = originalImage.width;
+    canvas.height = originalImage.height;
+    ctx.drawImage(originalImage, 0, 0);
+
+    // 2. Gambar overlay lingkaran merah
+    bubbleLocations.forEach((bubble) => {
+      const isSelected = studentAnswers[bubble.q] === bubble.opt;
+
+      if (isSelected) {
+        // Lingkaran Merah Tebal untuk Jawaban Terpilih
+        ctx.beginPath();
+        ctx.arc(bubble.x, bubble.y, bubble.r * 1.5, 0, 2 * Math.PI);
+        ctx.strokeStyle = "#ff0000";
+        ctx.lineWidth = 4;
+        ctx.stroke();
+
+        // Fill transparan biar kelihatan isinya
+        ctx.fillStyle = "rgba(255, 0, 0, 0.2)";
+        ctx.fill();
+      } else {
+        // (Opsional) Debug: Lingkaran hantu transparan untuk area klik
+        // ctx.beginPath();
+        // ctx.arc(bubble.x, bubble.y, bubble.r, 0, 2 * Math.PI);
+        // ctx.strokeStyle = "rgba(255, 255, 255, 0.3)";
+        // ctx.stroke();
+      }
+    });
+  }, [originalImage, bubbleLocations, studentAnswers]);
+
+  useEffect(() => {
+    if (scanStage === "result") {
+      drawResultCanvas();
+    }
+  }, [scanStage, studentAnswers, drawResultCanvas]);
+
+  // Handler Klik di Canvas Hasil
+  const handleResultCanvasClick = (e) => {
+    if (!resultCanvasRef.current) return;
+    const canvas = resultCanvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+
+    // Hitung posisi klik relatif terhadap skala gambar asli
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+
+    const clickX = (e.clientX - rect.left) * scaleX;
+    const clickY = (e.clientY - rect.top) * scaleY;
+
+    // Cari bulatan terdekat
+    let clickedBubble = null;
+    let minDist = Infinity;
+
+    bubbleLocations.forEach((bubble) => {
+      const dx = clickX - bubble.x;
+      const dy = clickY - bubble.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      // Radius toleransi klik (agak diperbesar biar gampang diklik jari)
+      if (dist < bubble.r * 2.5) {
+        if (dist < minDist) {
+          minDist = dist;
+          clickedBubble = bubble;
+        }
+      }
+    });
+
+    if (clickedBubble) {
+      // Toggle Logic
+      setStudentAnswers((prev) => {
+        const currentVal = prev[clickedBubble.q];
+        const newVal = { ...prev };
+
+        if (currentVal === clickedBubble.opt) {
+          // Jika sudah dipilih -> Hapus (Uncheck)
+          delete newVal[clickedBubble.q];
+        } else {
+          // Jika belum dipilih -> Pilih ini (Ganti jawaban)
+          newVal[clickedBubble.q] = clickedBubble.opt;
+        }
+        return newVal;
+      });
+    }
+  };
+
+  // --- RENDER ---
 
   return (
     <div className="min-h-screen bg-gray-50 font-sans text-gray-800 max-w-md mx-auto border-x shadow-xl pb-20 relative">
@@ -516,7 +594,6 @@ export default function App() {
               </div>
             )}
           </div>
-
           <div
             className="flex-1 relative bg-black flex flex-col items-center justify-center"
             onClick={triggerFocus}
@@ -531,7 +608,6 @@ export default function App() {
               Ketuk layar agar fokus
             </div>
           </div>
-
           <div className="p-8 bg-black flex justify-around items-center relative z-20">
             <button
               onClick={capturePhoto}
@@ -543,7 +619,7 @@ export default function App() {
         </div>
       )}
 
-      {/* EDITOR OVERLAY */}
+      {/* EDITOR OVERLAY (PRE-SCAN) */}
       {scanStage === "preview" && (
         <div className="fixed inset-0 z-40 bg-gray-900 flex flex-col">
           <div className="bg-gray-800 p-3 flex justify-between items-center text-white border-b border-gray-700">
@@ -554,7 +630,6 @@ export default function App() {
               <XCircle className="text-gray-400 hover:text-white" />
             </button>
           </div>
-
           <div className="flex-1 bg-black relative overflow-auto flex items-center justify-center p-4">
             {previewUrl && (
               <img
@@ -563,8 +638,6 @@ export default function App() {
                 alt="Preview"
               />
             )}
-
-            {/* Status Indicator */}
             <div className="absolute top-4 left-4 space-y-1">
               {detectedRows.length === 10 ? (
                 <div className="flex items-center gap-2 bg-green-500/90 text-white px-3 py-1 rounded-full text-[10px] font-bold shadow backdrop-blur">
@@ -576,7 +649,6 @@ export default function App() {
                 </div>
               )}
             </div>
-
             {isProcessing && (
               <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center text-white z-50">
                 <RefreshCw className="animate-spin w-10 h-10 text-indigo-400 mb-3" />
@@ -584,10 +656,7 @@ export default function App() {
               </div>
             )}
           </div>
-
-          {/* FILTER CONTROLS */}
           <div className="bg-gray-800 p-4 border-t border-gray-700 space-y-4">
-            {/* Filter Toggle */}
             <div className="flex bg-gray-700 p-1 rounded-lg">
               <button
                 onClick={() => setFilterMode("magic")}
@@ -610,8 +679,6 @@ export default function App() {
                 <SlidersHorizontal className="w-3 h-3" /> Manual
               </button>
             </div>
-
-            {/* Manual Slider */}
             {filterMode === "manual" && (
               <div className="space-y-1 animate-in fade-in">
                 <div className="flex justify-between text-[10px] text-gray-400">
@@ -634,14 +701,6 @@ export default function App() {
                 />
               </div>
             )}
-
-            {filterMode === "magic" && (
-              <p className="text-[10px] text-gray-400 text-center">
-                Filter ini otomatis membuang bayangan dan kotak anchor
-                pengganggu.
-              </p>
-            )}
-
             <button
               onClick={processScan}
               className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold flex justify-center items-center gap-2 shadow-lg transition active:scale-95"
@@ -658,7 +717,7 @@ export default function App() {
         <div className="flex items-center gap-2 font-bold text-indigo-800">
           <ScanLine /> LJK Pro{" "}
           <span className="text-xs bg-indigo-100 text-indigo-600 px-1 rounded">
-            Rev3
+            Interactive
           </span>
         </div>
         <div className="text-xs text-gray-500">{history.length} Data</div>
@@ -716,82 +775,99 @@ export default function App() {
           </div>
         )}
 
+        {/* RESULT STAGE: VISUAL EDITOR */}
         {mode === "scan" && scanStage === "result" && (
-          <div className="bg-white p-4 rounded-lg shadow border space-y-4">
-            <div className="flex justify-between items-center border-b pb-2">
-              <h2 className="font-bold text-lg text-gray-800">Hasil</h2>
-              <div
-                className={`text-2xl font-bold ${
-                  currentScore >= 75 ? "text-green-600" : "text-red-600"
-                }`}
-              >
-                {currentScore}
+          <div className="space-y-4 animate-in slide-in-from-bottom-4">
+            {/* 1. VISUAL EDITOR CANVAS */}
+            <div className="bg-black rounded-lg overflow-hidden shadow-lg relative group">
+              <canvas
+                ref={resultCanvasRef}
+                onClick={handleResultCanvasClick}
+                className="w-full h-auto cursor-crosshair touch-none"
+              />
+              <div className="absolute top-2 right-2 bg-black/70 text-white text-[10px] px-2 py-1 rounded-full backdrop-blur pointer-events-none">
+                <MousePointerClick className="w-3 h-3 inline mr-1" />
+                Klik bulatan untuk edit manual
               </div>
             </div>
 
-            <div className="space-y-2">
-              <label className="text-[10px] font-bold text-gray-400 uppercase">
-                Nama Siswa
-              </label>
-              <input
-                value={studentName}
-                onChange={(e) => setStudentName(e.target.value)}
-                className="w-full font-bold text-lg border-b-2 border-indigo-100 focus:border-indigo-500 outline-none uppercase"
-                placeholder="KETIK NAMA..."
-              />
-            </div>
+            {/* 2. SCORE & NAME INPUT */}
+            <div className="bg-white p-4 rounded-lg shadow border space-y-3">
+              <div className="flex justify-between items-center border-b pb-2">
+                <h2 className="font-bold text-gray-700">Verifikasi Hasil</h2>
+                <div
+                  className={`text-2xl font-bold ${
+                    currentScore >= 75 ? "text-green-600" : "text-red-600"
+                  }`}
+                >
+                  {currentScore}
+                </div>
+              </div>
 
-            <div className="grid grid-cols-5 gap-1 text-[10px]">
-              {Array.from({ length: 50 }, (_, i) => i + 1).map((q) => {
-                const isCorrect = studentAnswers[q] === answerKey[q];
-                const filled = studentAnswers[q];
-                return (
-                  <div
-                    key={q}
-                    className={`border rounded p-1 text-center ${
-                      isCorrect && answerKey[q]
-                        ? "bg-green-100 text-green-800 border-green-300"
-                        : filled
-                        ? "bg-red-100 text-red-800 border-red-200"
-                        : "bg-gray-50 text-gray-400"
-                    }`}
-                  >
-                    <span className="opacity-50 mr-1">{q}</span>
-                    <span className="font-bold">{filled || "-"}</span>
-                  </div>
-                );
-              })}
-            </div>
+              <div>
+                <label className="text-[10px] font-bold text-gray-400 uppercase">
+                  Nama Siswa
+                </label>
+                <input
+                  value={studentName}
+                  onChange={(e) => setStudentName(e.target.value)}
+                  className="w-full font-bold text-lg border-b-2 border-indigo-100 focus:border-indigo-500 outline-none uppercase"
+                  placeholder="KETIK NAMA..."
+                />
+              </div>
 
-            <div className="flex gap-2">
-              <button
-                onClick={() => {
-                  if (!studentName) return alert("Isi nama dulu");
-                  setHistory((h) => [
-                    {
-                      id: Date.now(),
-                      name: studentName,
-                      className,
-                      answers: studentAnswers,
-                      timestamp: new Date().toLocaleString(),
-                      stats: { score: currentScore },
-                    },
-                    ...h,
-                  ]);
-                  setScanStage("capture");
-                  setStudentName("");
-                  setStudentAnswers({});
-                }}
-                className="bg-green-600 text-white px-4 py-2 rounded font-bold flex-1"
-              >
-                Simpan
-              </button>
-              <button
-                onClick={() => setScanStage("capture")}
-                className="bg-gray-100 px-4 py-2 rounded font-bold"
-              >
-                Batal
-              </button>
+              {/* TABEL RINGKASAN KECIL */}
+              <div className="grid grid-cols-5 gap-1 text-[10px]">
+                {Array.from({ length: 50 }, (_, i) => i + 1).map((q) => {
+                  const filled = studentAnswers[q];
+                  const isCorrect = filled === answerKey[q];
+                  if (!filled) return null; // Hanya tampilkan yang terisi untuk hemat tempat? Atau tampilkan semua? Tampilkan yg salah saja? Tampilkan semua.
+                  return (
+                    <div
+                      key={q}
+                      className={`border rounded px-1 text-center ${
+                        isCorrect
+                          ? "bg-green-100 text-green-800"
+                          : "bg-red-100 text-red-800"
+                      }`}
+                    >
+                      <span className="opacity-50 mr-1">{q}</span>
+                      <b>{filled}</b>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  onClick={() => {
+                    if (!studentName) return alert("Isi nama dulu");
+                    setHistory((h) => [
+                      {
+                        id: Date.now(),
+                        name: studentName,
+                        className,
+                        answers: studentAnswers,
+                        timestamp: new Date().toLocaleString(),
+                        stats: { score: currentScore },
+                      },
+                      ...h,
+                    ]);
+                    setScanStage("capture");
+                    setStudentName("");
+                    setStudentAnswers({});
+                  }}
+                  className="bg-green-600 text-white px-4 py-3 rounded-lg font-bold flex-1 shadow hover:bg-green-500 transition"
+                >
+                  Simpan Data
+                </button>
+                <button
+                  onClick={() => setScanStage("capture")}
+                  className="bg-gray-100 text-gray-600 px-4 py-3 rounded-lg font-bold hover:bg-gray-200 transition"
+                >
+                  Batal
+                </button>
+              </div>
             </div>
           </div>
         )}
