@@ -76,7 +76,7 @@ export default function App() {
 
   // Camera State
   const [isCameraOpen, setIsCameraOpen] = useState(false);
-  const [autoCapture, setAutoCapture] = useState(false); // Default OFF biar user tidak bingung
+  const [autoCapture, setAutoCapture] = useState(false);
   const [cameraFeedback, setCameraFeedback] = useState("Arahkan ke LJK");
   const [zoomLevel, setZoomLevel] = useState(1);
   const [maxZoom, setMaxZoom] = useState(1);
@@ -97,7 +97,7 @@ export default function App() {
   const canvasRef = useRef(null);
   const videoRef = useRef(null);
   const streamRef = useRef(null);
-  const trackRef = useRef(null); // Track video untuk kontrol zoom/fokus
+  const trackRef = useRef(null);
   const scanIntervalRef = useRef(null);
   const uploadInputRef = useRef(null);
 
@@ -111,6 +111,17 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("ljk_className", className);
   }, [className]);
+
+  // --- PERHITUNGAN SKOR (DIPINDAHKAN KE SINI AGAR TIDAK CRASH) ---
+  const currentScore = useMemo(() => {
+    const k = Object.keys(answerKey);
+    if (!k.length) return 0;
+    let c = 0;
+    k.forEach((q) => {
+      if (studentAnswers[q] === answerKey[q]) c++;
+    });
+    return Math.round((c / k.length) * 100);
+  }, [studentAnswers, answerKey]);
 
   // --- CORE DETECTION LOGIC ---
 
@@ -146,7 +157,7 @@ export default function App() {
           if (inMark) {
             inMark = false;
             const h = y - markStart;
-            // Toleransi tinggi mark (sesuaikan jika kamera jauh/dekat)
+            // Toleransi tinggi mark
             if (h > height * 0.002 && h < height * 0.06) {
               marks.push(markStart + h / 2);
             }
@@ -161,7 +172,7 @@ export default function App() {
     [filters.threshold]
   );
 
-  // --- CAMERA LOGIC (ENHANCED FOCUS) ---
+  // --- CAMERA LOGIC ---
 
   const startCamera = async () => {
     setIsCameraOpen(true);
@@ -169,9 +180,9 @@ export default function App() {
       const constraints = {
         video: {
           facingMode: "environment",
-          width: { ideal: 1920 }, // Minta resolusi tinggi biar tajam
+          width: { ideal: 1920 },
           height: { ideal: 1080 },
-          focusMode: "continuous", // Request native autofocus
+          focusMode: "continuous",
         },
       };
 
@@ -185,7 +196,6 @@ export default function App() {
       }
       streamRef.current = stream;
 
-      // Get Track Capabilities (Zoom/Focus)
       const track = stream.getVideoTracks()[0];
       trackRef.current = track;
       const caps = track.getCapabilities();
@@ -209,7 +219,6 @@ export default function App() {
   };
 
   const triggerFocus = async () => {
-    // Trik memicu fokus ulang: zoom in dikit lalu balik, atau apply constraints ulang
     if (trackRef.current && trackRef.current.applyConstraints) {
       try {
         await trackRef.current.applyConstraints({
@@ -221,7 +230,6 @@ export default function App() {
           });
         }, 200);
       } catch (e) {
-        // Fallback
         console.log("Manual focus not supported");
       }
     }
@@ -238,7 +246,7 @@ export default function App() {
     if (scanIntervalRef.current) clearInterval(scanIntervalRef.current);
     scanIntervalRef.current = setInterval(() => {
       if (!videoRef.current || !autoCapture) return;
-      // ... (logika auto capture sama, tapi threshold lebih longgar)
+      // Logic auto capture
     }, 500);
   };
 
@@ -260,7 +268,7 @@ export default function App() {
     }
   };
 
-  // --- PREVIEW & EDITOR (THE "GREEN LINE" FIX) ---
+  // --- PREVIEW & EDITOR ---
 
   const updatePreviewAndDetect = useCallback(() => {
     if (!originalImage || !canvasRef.current) return;
@@ -273,7 +281,6 @@ export default function App() {
 
     ctx.drawImage(originalImage, 0, 0);
 
-    // Visual Filter (B&W)
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const data = imageData.data;
     const thres = filters.threshold;
@@ -285,7 +292,6 @@ export default function App() {
     }
     ctx.putImageData(imageData, 0, 0);
 
-    // Detection
     const { validMarks } = analyzeImage(ctx, canvas.width, canvas.height);
 
     let rowsY = [];
@@ -293,8 +299,6 @@ export default function App() {
       rowsY = validMarks.slice(-10);
       setCameraFeedback("Mode Dinamis: Garis Hijau Aktif");
     } else {
-      // FALLBACK: Jika gagal deteksi, gunakan koordinat statis (Garis Merah)
-      // Estimasi posisi standar LJK
       setCameraFeedback(
         "Mode Statis: Garis Merah (Tidak ada tanda terdeteksi)"
       );
@@ -304,14 +308,12 @@ export default function App() {
     }
     setDetectedRows(rowsY);
 
-    // Debug Overlay
     if (showDebugOverlay) {
       const w = canvas.width;
       rowsY.forEach((y, i) => {
         ctx.beginPath();
         ctx.moveTo(0, y);
         ctx.lineTo(w, y);
-        // Hijau jika terdeteksi dinamis, Merah jika statis (fallback)
         ctx.strokeStyle = validMarks.length >= 10 ? "#00ff00" : "#ff0000";
         ctx.lineWidth = validMarks.length >= 10 ? 3 : 1;
         ctx.stroke();
@@ -345,7 +347,6 @@ export default function App() {
     const w = canvas.width;
     const h = canvas.height;
 
-    // Redraw B/W without overlay
     ctx.drawImage(originalImage, 0, 0);
     const imgData = ctx.getImageData(0, 0, w, h);
     const d = imgData.data;
@@ -358,17 +359,14 @@ export default function App() {
     ctx.putImageData(imgData, 0, 0);
 
     const answers = {};
-    // Use whatever rows we have (Dynamic Green or Static Red)
     let yCoords = detectedRows;
     if (yCoords.length < 10) {
-      // Safety fallback again
       const startY = h * 0.805;
       yCoords = Array.from({ length: 10 }, (_, i) => startY + i * (h * 0.0165));
     } else {
       yCoords = yCoords.slice(-10);
     }
 
-    // Kolom X Statis (Cukup akurat jika foto tegak)
     const colX = [0.045, 0.24, 0.435, 0.63, 0.825];
     const optGap = w * 0.028;
 
@@ -385,7 +383,6 @@ export default function App() {
           const x = baseX + 25 + oIdx * optGap;
           const dark = getDarkness(ctx, x, y, w * 0.006);
           if (dark > 35 && dark > maxD) {
-            // Threshold isian 35%
             maxD = dark;
             best = opt;
           }
@@ -395,8 +392,12 @@ export default function App() {
     });
     setStudentAnswers(answers);
     setProcessingStep("Selesai");
-    setIsProcessing(false);
-    setScanStage("result");
+
+    // Delay sedikit untuk memastikan UI update
+    setTimeout(() => {
+      setIsProcessing(false);
+      setScanStage("result");
+    }, 500);
   };
 
   return (
@@ -443,7 +444,6 @@ export default function App() {
           </div>
 
           <div className="p-8 bg-black flex justify-around items-center relative z-20">
-            {/* Manual Capture ALWAYS Active */}
             <button
               onClick={capturePhoto}
               className="w-20 h-20 bg-white rounded-full border-4 border-gray-300 active:scale-95 transition-transform flex items-center justify-center"
@@ -454,7 +454,7 @@ export default function App() {
         </div>
       )}
 
-      {/* EDITOR OVERLAY (FIXED) */}
+      {/* EDITOR OVERLAY */}
       {scanStage === "preview" && (
         <div className="fixed inset-0 z-40 bg-gray-900 flex flex-col">
           <div className="bg-gray-800 p-3 flex justify-between items-center text-white border-b border-gray-700">
@@ -475,7 +475,6 @@ export default function App() {
               />
             )}
 
-            {/* Legend */}
             <div className="absolute top-4 left-4 bg-black/60 backdrop-blur p-2 rounded text-[10px] text-white space-y-1 border border-white/10">
               <div className="flex items-center gap-2">
                 <div className="w-3 h-3 bg-green-500 rounded-full"></div>{" "}
@@ -518,7 +517,6 @@ export default function App() {
               className="w-full h-4 bg-gray-600 rounded-lg accent-indigo-500 cursor-pointer mb-4"
             />
 
-            {/* TOMBOL SELALU AKTIF */}
             <button
               onClick={processScan}
               className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold flex justify-center items-center gap-2 shadow-lg"
@@ -599,15 +597,7 @@ export default function App() {
             <div className="flex justify-between items-center border-b pb-2">
               <h2 className="font-bold text-lg text-gray-800">Hasil</h2>
               <div className="text-2xl font-bold text-indigo-600">
-                {useMemo(() => {
-                  const k = Object.keys(answerKey);
-                  if (!k.length) return 0;
-                  let c = 0;
-                  k.forEach((q) => {
-                    if (studentAnswers[q] === answerKey[q]) c++;
-                  });
-                  return Math.round((c / k.length) * 100);
-                }, [studentAnswers, answerKey])}
+                {currentScore}
               </div>
             </div>
 
@@ -656,7 +646,7 @@ export default function App() {
                       className,
                       answers: studentAnswers,
                       timestamp: new Date().toLocaleString(),
-                      stats: { score: 0 },
+                      stats: { score: currentScore },
                     },
                     ...h,
                   ]);
@@ -678,7 +668,6 @@ export default function App() {
           </div>
         )}
 
-        {/* ... (Mode Key & History sama seperti sebelumnya) ... */}
         {mode === "key" && (
           <div className="bg-white p-4 rounded shadow border">
             <div className="flex justify-between mb-4">
