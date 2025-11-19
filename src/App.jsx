@@ -177,49 +177,97 @@ export default function App() {
     ctx.putImageData(imageData, 0, 0);
   };
 
-  // --- DETECTION LOGIC (IMPROVED) ---
+  // --- DETECTION LOGIC (SMART SEQUENCE) ---
+
+  // Helper: Cari sequence 10 baris yang jaraknya paling konsisten
+  const findBestRowSequence = (marks) => {
+    if (marks.length < 10) return [];
+    if (marks.length === 10) return marks;
+
+    let bestSequence = [];
+    let minVariance = Infinity;
+
+    // Sliding window: Coba ambil 10 item dari index 0, lalu index 1, dst.
+    // Tujuannya mencari mana yang jarak antar barisnya paling "sama"
+    for (let i = 0; i <= marks.length - 10; i++) {
+      const sequence = marks.slice(i, i + 10);
+
+      // Hitung jarak antar baris dalam sequence ini
+      let gaps = [];
+      for (let j = 0; j < sequence.length - 1; j++) {
+        gaps.push(sequence[j + 1] - sequence[j]);
+      }
+
+      // Hitung Variance (Ketidakteraturan jarak)
+      const avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+      const variance =
+        gaps.reduce((a, b) => a + Math.pow(b - avgGap, 2), 0) / gaps.length;
+
+      if (variance < minVariance) {
+        minVariance = variance;
+        bestSequence = sequence;
+      }
+    }
+
+    return bestSequence;
+  };
 
   const analyzeImage = useCallback((ctx, width, height) => {
     const imageData = ctx.getImageData(0, 0, width, height);
     const data = imageData.data;
 
-    // Scan margin kiri (3% dari kiri)
-    const scanX = Math.floor(width * 0.03);
-    let marks = [];
-    let inMark = false;
-    let markStart = 0;
+    // Scan margin kiri (Geser sedikit ke 3.5% - 4% karena kadang foto miring)
+    // Kita coba scan beberapa garis vertikal untuk memastikan ketemu
+    const scanXCandidates = [width * 0.025, width * 0.035, width * 0.045];
+    let bestMarks = [];
 
-    for (let y = 0; y < height; y++) {
-      const idx = (y * width + scanX) * 4;
-      const isBlack = data[idx] === 0;
+    for (let scanX of scanXCandidates) {
+      scanX = Math.floor(scanX);
+      let marks = [];
+      let inMark = false;
+      let markStart = 0;
 
-      if (isBlack) {
-        if (!inMark) {
-          inMark = true;
-          markStart = y;
-        }
-      } else {
-        if (inMark) {
-          inMark = false;
-          const h = y - markStart;
-          // FILTER 1: Validasi Tinggi
-          // Min 0.3% (untuk ignore noise)
-          // Max 2.5% (PENTING: Kotak Anchor biasanya > 3%, jadi ini akan memfilter kotak bawah)
-          if (h > height * 0.003 && h < height * 0.025) {
-            marks.push(markStart + h / 2);
+      for (let y = 0; y < height; y++) {
+        const idx = (y * width + scanX) * 4;
+        const isBlack = data[idx] === 0;
+
+        if (isBlack) {
+          if (!inMark) {
+            inMark = true;
+            markStart = y;
           }
+        } else {
+          if (inMark) {
+            inMark = false;
+            const h = y - markStart;
+            // Strict Filter Tinggi:
+            // Minimal 0.2% (biar noise titik hilang)
+            // Maksimal 2.0% (PENTING: Kotak anchor bawah biasanya tebal > 2.5%, jadi ini filter kuncinya)
+            if (h > height * 0.002 && h < height * 0.022) {
+              marks.push(markStart + h / 2);
+            }
+          }
+        }
+      }
+
+      // Filter Area Y: Hanya ambil paruh bawah (Jawaban)
+      // Kita longgarkan sedikit batas bawah (0.92) tapi andalkan logika Sequence untuk membuang anchor
+      const candidates = marks.filter(
+        (y) => y > height * 0.5 && y < height * 0.92
+      );
+
+      if (candidates.length >= 10) {
+        // Jika scan line ini menemukan cukup kandidat, gunakan ini
+        if (candidates.length > bestMarks.length) {
+          bestMarks = candidates;
         }
       }
     }
 
-    // FILTER 2: Validasi Posisi Y
-    // Ambil tanda yang ada di area jawaban (55% - 89% tinggi kertas)
-    // Batas 89% ini penting agar kotak anchor di posisi 90-95% tidak terambil
-    const validMarks = marks.filter(
-      (y) => y > height * 0.55 && y < height * 0.89
-    );
+    // SMART SEQUENCE: Pilih 10 baris terbaik dari kandidat
+    const finalRows = findBestRowSequence(bestMarks);
 
-    return { validMarks };
+    return { validMarks: finalRows, rawCount: bestMarks.length };
   }, []);
 
   // --- CAMERA LOGIC ---
@@ -331,20 +379,21 @@ export default function App() {
       applyManualFilter(ctx, canvas.width, canvas.height);
     }
 
-    const { validMarks } = analyzeImage(ctx, canvas.width, canvas.height);
+    const { validMarks, rawCount } = analyzeImage(
+      ctx,
+      canvas.width,
+      canvas.height
+    );
 
-    // FILTER 3: Smart Selection (Ambil 10 baris paling masuk akal)
     let rowsY = [];
-    if (validMarks.length >= 10) {
-      // Jika terdeteksi lebih dari 10, kita harus hati-hati.
-      // Ambil 10 baris terakhir, TAPI karena kita sudah filter area bawah (<89%),
-      // seharusnya aman.
-      rowsY = validMarks.slice(-10);
+    if (validMarks.length === 10) {
+      rowsY = validMarks;
       setCameraFeedback("Mode Dinamis: OK");
     } else {
-      setCameraFeedback("Mode Statis (Fallback)");
-      const startY = canvas.height * 0.805;
-      const stepY = canvas.height * 0.0165;
+      setCameraFeedback("Mode Statis (Gagal Deteksi)");
+      // Fallback Statis (Diset mendekati layout LJK rev3)
+      const startY = canvas.height * 0.58; // Mulai agak tengah
+      const stepY = canvas.height * 0.033; // Jarak antar baris lebih lebar
       rowsY = Array.from({ length: 10 }, (_, i) => startY + i * stepY);
     }
     setDetectedRows(rowsY);
@@ -355,9 +404,14 @@ export default function App() {
         ctx.beginPath();
         ctx.moveTo(0, y);
         ctx.lineTo(w, y);
-        ctx.strokeStyle = validMarks.length >= 10 ? "#00ff00" : "#ff0000";
-        ctx.lineWidth = validMarks.length >= 10 ? 4 : 2;
+        ctx.strokeStyle = validMarks.length === 10 ? "#00ff00" : "#ff0000";
+        ctx.lineWidth = validMarks.length === 10 ? 4 : 2;
         ctx.stroke();
+
+        // Tulis nomor baris untuk debug
+        ctx.fillStyle = validMarks.length === 10 ? "#00ff00" : "#ff0000";
+        ctx.font = "bold 20px sans-serif";
+        ctx.fillText((i + 1).toString(), 10, y - 5);
       });
     }
     setPreviewUrl(canvas.toDataURL());
@@ -388,21 +442,21 @@ export default function App() {
     const w = canvas.width;
 
     const answers = {};
+    // Gunakan detectedRows yang sudah disaring oleh "Smart Sequence"
     let yCoords = detectedRows;
 
-    // Double check saat proses final
-    if (yCoords.length < 10) {
-      const startY = canvas.height * 0.805;
+    // Fallback Akhir jika array kosong/tidak valid
+    if (yCoords.length !== 10) {
+      const startY = canvas.height * 0.58;
       yCoords = Array.from(
         { length: 10 },
-        (_, i) => startY + i * (canvas.height * 0.0165)
+        (_, i) => startY + i * (canvas.height * 0.033)
       );
-    } else {
-      // Pastikan kita pakai 10 baris terbawah dari hasil filter yang ketat
-      yCoords = yCoords.slice(-10);
     }
 
-    const colX = [0.045, 0.24, 0.435, 0.63, 0.825];
+    // Koordinat X Kolom (LJK Rev3 sepertinya agak geser)
+    // Kita sesuaikan X ini:
+    const colX = [0.04, 0.235, 0.43, 0.625, 0.82];
     const optGap = w * 0.028;
 
     colX.forEach((cx, cIdx) => {
@@ -417,7 +471,8 @@ export default function App() {
         ["A", "B", "C", "D", "E"].forEach((opt, oIdx) => {
           const x = baseX + 25 + oIdx * optGap;
           const dark = getDarkness(ctx, x, y, w * 0.006);
-          if (dark > 35 && dark > maxD) {
+          // Threshold isian 40% biar tidak false positive
+          if (dark > 40 && dark > maxD) {
             maxD = dark;
             best = opt;
           }
@@ -511,13 +566,13 @@ export default function App() {
 
             {/* Status Indicator */}
             <div className="absolute top-4 left-4 space-y-1">
-              {detectedRows.length >= 10 ? (
+              {detectedRows.length === 10 ? (
                 <div className="flex items-center gap-2 bg-green-500/90 text-white px-3 py-1 rounded-full text-[10px] font-bold shadow backdrop-blur">
-                  <CheckCircle2 className="w-3 h-3" /> LJK Terdeteksi (Dinamis)
+                  <CheckCircle2 className="w-3 h-3" /> Dinamis: 10 Baris Valid
                 </div>
               ) : (
                 <div className="flex items-center gap-2 bg-red-500/90 text-white px-3 py-1 rounded-full text-[10px] font-bold shadow backdrop-blur">
-                  <XCircle className="w-3 h-3" /> Mode Fallback (Statis)
+                  <XCircle className="w-3 h-3" /> Statis (Cek Pencahayaan)
                 </div>
               )}
             </div>
@@ -582,8 +637,8 @@ export default function App() {
 
             {filterMode === "magic" && (
               <p className="text-[10px] text-gray-400 text-center">
-                Mode Magic otomatis membersihkan bayangan dan mempertajam tanda
-                LJK agar Garis Hijau muncul.
+                Filter ini otomatis membuang bayangan dan kotak anchor
+                pengganggu.
               </p>
             )}
 
@@ -603,7 +658,7 @@ export default function App() {
         <div className="flex items-center gap-2 font-bold text-indigo-800">
           <ScanLine /> LJK Pro{" "}
           <span className="text-xs bg-indigo-100 text-indigo-600 px-1 rounded">
-            Enhance
+            Rev3
           </span>
         </div>
         <div className="text-xs text-gray-500">{history.length} Data</div>
