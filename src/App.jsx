@@ -28,6 +28,8 @@ import {
   ZapOff,
   Focus,
   ZoomIn,
+  Wand2,
+  SlidersHorizontal,
 } from "lucide-react";
 
 // --- TESSERACT LOADER ---
@@ -84,8 +86,11 @@ export default function App() {
   // Image State
   const [originalImage, setOriginalImage] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
+
+  // Filter Settings
+  const [filterMode, setFilterMode] = useState("magic"); // 'magic' (Auto) or 'manual'
   const [filters, setFilters] = useState({
-    threshold: 110,
+    threshold: 110, // Untuk mode manual
     brightness: 10,
     contrast: 20,
   });
@@ -95,6 +100,7 @@ export default function App() {
   const [anchorTopLeft, setAnchorTopLeft] = useState(null);
 
   const canvasRef = useRef(null);
+  const blurCanvasRef = useRef(null); // Canvas helper untuk Magic Filter
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const trackRef = useRef(null);
@@ -112,7 +118,6 @@ export default function App() {
     localStorage.setItem("ljk_className", className);
   }, [className]);
 
-  // --- PERHITUNGAN SKOR (DIPINDAHKAN KE SINI AGAR TIDAK CRASH) ---
   const currentScore = useMemo(() => {
     const k = Object.keys(answerKey);
     if (!k.length) return 0;
@@ -123,54 +128,105 @@ export default function App() {
     return Math.round((c / k.length) * 100);
   }, [studentAnswers, answerKey]);
 
-  // --- CORE DETECTION LOGIC ---
+  // --- IMAGE PROCESSING ENGINE ---
 
-  const analyzeImage = useCallback(
-    (ctx, width, height, customThreshold = null) => {
-      const threshold = customThreshold || filters.threshold;
-      const imageData = ctx.getImageData(0, 0, width, height);
-      const data = imageData.data;
+  // 1. Magic Enhance (Adaptive Thresholding)
+  // Teknik ini meniru Scanner: Membandingkan pixel dengan rata-rata area sekitarnya (blur)
+  // untuk menghilangkan bayangan dan menonjolkan tinta.
+  const applyMagicFilter = (ctx, width, height) => {
+    // Ambil data asli
+    const imgData = ctx.getImageData(0, 0, width, height);
+    const src = imgData.data;
 
-      // 1. Binarize on the fly
-      for (let i = 0; i < data.length; i += 4) {
-        const avg = (data[i] + data[i + 1] + data[i + 2]) / 3;
-        const val = avg < threshold ? 0 : 255;
-        data[i] = val; // R channel
-      }
+    // Buat versi blur untuk estimasi background
+    // Kita pakai canvas terpisah/offscreen biar cepat (GPU accelerated blur)
+    let blurCtx = blurCanvasRef.current?.getContext("2d");
+    if (!blurCanvasRef.current) {
+      const c = document.createElement("canvas");
+      c.width = width;
+      c.height = height;
+      blurCtx = c.getContext("2d");
+      blurCanvasRef.current = c;
+    } else {
+      blurCanvasRef.current.width = width;
+      blurCanvasRef.current.height = height;
+    }
 
-      // 2. Find Timing Marks (Left Margin)
-      const scanX = Math.floor(width * 0.025); // 2.5% from left
-      let marks = [];
-      let inMark = false;
-      let markStart = 0;
+    blurCtx.filter = "blur(20px)"; // Radius blur cukup besar untuk cover bayangan
+    blurCtx.drawImage(ctx.canvas, 0, 0);
+    const blurData = blurCtx.getImageData(0, 0, width, height).data;
 
-      for (let y = 0; y < height; y++) {
-        const idx = (y * width + scanX) * 4;
-        const isBlack = data[idx] === 0;
+    // Proses Adaptive Threshold
+    // Jika Pixel < (Background - Sensitivity) maka HITAM, else PUTIH
+    const sensitivity = 30; // Semakin besar, semakin sedikit noise, tapi tinta tipis mungkin hilang
 
-        if (isBlack) {
-          if (!inMark) {
-            inMark = true;
-            markStart = y;
-          }
-        } else {
-          if (inMark) {
-            inMark = false;
-            const h = y - markStart;
-            // Toleransi tinggi mark
-            if (h > height * 0.002 && h < height * 0.06) {
-              marks.push(markStart + h / 2);
-            }
+    for (let i = 0; i < src.length; i += 4) {
+      // Ambil luminance (hitam putih)
+      const gray = (src[i] + src[i + 1] + src[i + 2]) / 3;
+      const bg = (blurData[i] + blurData[i + 1] + blurData[i + 2]) / 3;
+
+      const val = gray < bg - sensitivity ? 0 : 255;
+
+      src[i] = val;
+      src[i + 1] = val;
+      src[i + 2] = val;
+      // src[i+3] alpha tetap 255
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+  };
+
+  // 2. Manual Filter (Global Threshold)
+  const applyManualFilter = (ctx, width, height) => {
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const data = imageData.data;
+    const thres = filters.threshold;
+    for (let i = 0; i < data.length; i += 4) {
+      const avg = (data[i] + data[i + 1] + data[i + 2]) / 3;
+      const val = avg < thres ? 0 : 255;
+      data[i] = val;
+      data[i + 1] = val;
+      data[i + 2] = val;
+    }
+    ctx.putImageData(imageData, 0, 0);
+  };
+
+  // --- DETECTION LOGIC ---
+
+  const analyzeImage = useCallback((ctx, width, height) => {
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const data = imageData.data;
+
+    // Find Timing Marks (Left Margin)
+    const scanX = Math.floor(width * 0.03); // 3% from left
+    let marks = [];
+    let inMark = false;
+    let markStart = 0;
+
+    for (let y = 0; y < height; y++) {
+      const idx = (y * width + scanX) * 4;
+      const isBlack = data[idx] === 0; // Data sudah biner (0 atau 255)
+
+      if (isBlack) {
+        if (!inMark) {
+          inMark = true;
+          markStart = y;
+        }
+      } else {
+        if (inMark) {
+          inMark = false;
+          const h = y - markStart;
+          // Toleransi tinggi mark
+          if (h > height * 0.003 && h < height * 0.05) {
+            marks.push(markStart + h / 2);
           }
         }
       }
+    }
 
-      // Ambil hanya yang di paruh bawah (area jawaban)
-      const validMarks = marks.filter((y) => y > height * 0.55);
-      return { validMarks };
-    },
-    [filters.threshold]
-  );
+    const validMarks = marks.filter((y) => y > height * 0.55);
+    return { validMarks };
+  }, []);
 
   // --- CAMERA LOGIC ---
 
@@ -185,9 +241,7 @@ export default function App() {
           focusMode: "continuous",
         },
       };
-
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
-
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         videoRef.current.onloadedmetadata = () => {
@@ -199,13 +253,12 @@ export default function App() {
       const track = stream.getVideoTracks()[0];
       trackRef.current = track;
       const caps = track.getCapabilities();
-
       if (caps.zoom) {
         setMaxZoom(caps.zoom.max);
         setZoomLevel(caps.zoom.min || 1);
       }
     } catch (err) {
-      alert("Gagal akses kamera: " + err.message);
+      alert("Error Kamera: " + err.message);
       setIsCameraOpen(false);
     }
   };
@@ -213,25 +266,24 @@ export default function App() {
   const handleZoom = (e) => {
     const z = Number(e.target.value);
     setZoomLevel(z);
-    if (trackRef.current && trackRef.current.applyConstraints) {
+    if (trackRef.current?.applyConstraints)
       trackRef.current.applyConstraints({ advanced: [{ zoom: z }] });
-    }
   };
 
   const triggerFocus = async () => {
-    if (trackRef.current && trackRef.current.applyConstraints) {
+    if (trackRef.current?.applyConstraints) {
       try {
         await trackRef.current.applyConstraints({
           advanced: [{ focusMode: "manual", focusDistance: 0.5 }],
         });
-        setTimeout(async () => {
-          await trackRef.current.applyConstraints({
-            advanced: [{ focusMode: "continuous" }],
-          });
-        }, 200);
-      } catch (e) {
-        console.log("Manual focus not supported");
-      }
+        setTimeout(
+          async () =>
+            await trackRef.current.applyConstraints({
+              advanced: [{ focusMode: "continuous" }],
+            }),
+          200
+        );
+      } catch (e) {}
     }
   };
 
@@ -246,7 +298,6 @@ export default function App() {
     if (scanIntervalRef.current) clearInterval(scanIntervalRef.current);
     scanIntervalRef.current = setInterval(() => {
       if (!videoRef.current || !autoCapture) return;
-      // Logic auto capture
     }, 500);
   };
 
@@ -257,7 +308,6 @@ export default function App() {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
       canvas.getContext("2d").drawImage(video, 0, 0);
-
       const img = new Image();
       img.onload = () => {
         setOriginalImage(img);
@@ -279,48 +329,45 @@ export default function App() {
     canvas.width = originalImage.width;
     canvas.height = originalImage.height;
 
+    // 1. Draw Original
     ctx.drawImage(originalImage, 0, 0);
 
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const data = imageData.data;
-    const thres = filters.threshold;
-    for (let i = 0; i < data.length; i += 4) {
-      const val = (data[i] + data[i + 1] + data[i + 2]) / 3 < thres ? 0 : 255;
-      data[i] = val;
-      data[i + 1] = val;
-      data[i + 2] = val;
+    // 2. Apply Filter (Magic or Manual)
+    if (filterMode === "magic") {
+      applyMagicFilter(ctx, canvas.width, canvas.height);
+    } else {
+      applyManualFilter(ctx, canvas.width, canvas.height);
     }
-    ctx.putImageData(imageData, 0, 0);
 
+    // 3. Detect
     const { validMarks } = analyzeImage(ctx, canvas.width, canvas.height);
 
     let rowsY = [];
     if (validMarks.length >= 10) {
       rowsY = validMarks.slice(-10);
-      setCameraFeedback("Mode Dinamis: Garis Hijau Aktif");
+      setCameraFeedback("Mode Dinamis: OK");
     } else {
-      setCameraFeedback(
-        "Mode Statis: Garis Merah (Tidak ada tanda terdeteksi)"
-      );
+      setCameraFeedback("Mode Statis (Fallback)");
       const startY = canvas.height * 0.805;
       const stepY = canvas.height * 0.0165;
       rowsY = Array.from({ length: 10 }, (_, i) => startY + i * stepY);
     }
     setDetectedRows(rowsY);
 
+    // 4. Debug Overlay
     if (showDebugOverlay) {
       const w = canvas.width;
       rowsY.forEach((y, i) => {
         ctx.beginPath();
         ctx.moveTo(0, y);
         ctx.lineTo(w, y);
-        ctx.strokeStyle = validMarks.length >= 10 ? "#00ff00" : "#ff0000";
-        ctx.lineWidth = validMarks.length >= 10 ? 3 : 1;
+        ctx.strokeStyle = validMarks.length >= 10 ? "#00ff00" : "#ff0000"; // Hijau = Sukses Enhance
+        ctx.lineWidth = validMarks.length >= 10 ? 4 : 2;
         ctx.stroke();
       });
     }
     setPreviewUrl(canvas.toDataURL());
-  }, [originalImage, filters, showDebugOverlay, analyzeImage]);
+  }, [originalImage, filterMode, filters, showDebugOverlay, analyzeImage]);
 
   useEffect(() => {
     updatePreviewAndDetect();
@@ -340,29 +387,22 @@ export default function App() {
   const processScan = async () => {
     if (!canvasRef.current) return;
     setIsProcessing(true);
-    setProcessingStep("Membaca Jawaban...");
+    setProcessingStep("Analisis Jawaban...");
 
+    // Gunakan hasil canvas yang SUDAH di-filter (Magic/Manual)
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
     const w = canvas.width;
-    const h = canvas.height;
-
-    ctx.drawImage(originalImage, 0, 0);
-    const imgData = ctx.getImageData(0, 0, w, h);
-    const d = imgData.data;
-    for (let i = 0; i < d.length; i += 4) {
-      const v = (d[i] + d[i + 1] + d[i + 2]) / 3 < filters.threshold ? 0 : 255;
-      d[i] = v;
-      d[i + 1] = v;
-      d[i + 2] = v;
-    }
-    ctx.putImageData(imgData, 0, 0);
 
     const answers = {};
     let yCoords = detectedRows;
+    // Fallback koordinat jika gagal total
     if (yCoords.length < 10) {
-      const startY = h * 0.805;
-      yCoords = Array.from({ length: 10 }, (_, i) => startY + i * (h * 0.0165));
+      const startY = canvas.height * 0.805;
+      yCoords = Array.from(
+        { length: 10 },
+        (_, i) => startY + i * (canvas.height * 0.0165)
+      );
     } else {
       yCoords = yCoords.slice(-10);
     }
@@ -391,9 +431,12 @@ export default function App() {
       }
     });
     setStudentAnswers(answers);
-    setProcessingStep("Selesai");
 
-    // Delay sedikit untuk memastikan UI update
+    setProcessingStep("OCR Nama...");
+    // OCR Sederhana (Opsional, seringkali lebih baik manual jika tulisan jelek)
+    // Kita skip OCR otomatis di sini agar cepat, user bisa input nama manual
+    // atau kita bisa enable jika Tesseract ready
+
     setTimeout(() => {
       setIsProcessing(false);
       setScanStage("result");
@@ -410,7 +453,7 @@ export default function App() {
               <XCircle />
             </button>
             {maxZoom > 1 && (
-              <div className="flex items-center gap-2 bg-black/50 px-3 py-1 rounded-full">
+              <div className="flex items-center gap-2 bg-black/50 px-3 py-1 rounded-full backdrop-blur">
                 <ZoomIn className="w-4 h-4" />
                 <input
                   type="range"
@@ -419,7 +462,7 @@ export default function App() {
                   step="0.1"
                   value={zoomLevel}
                   onChange={handleZoom}
-                  className="w-24 h-1 accent-white"
+                  className="w-20 h-1 accent-white"
                 />
                 <span className="text-xs font-mono">
                   {zoomLevel.toFixed(1)}x
@@ -438,15 +481,15 @@ export default function App() {
               playsInline
               className="w-full h-full object-cover opacity-90"
             />
-            <div className="absolute pointer-events-none text-white/70 text-sm animate-pulse mt-40">
-              Tap layar untuk fokus
+            <div className="absolute pointer-events-none text-white/70 text-sm animate-pulse mt-40 font-medium drop-shadow-md">
+              Ketuk layar agar fokus
             </div>
           </div>
 
           <div className="p-8 bg-black flex justify-around items-center relative z-20">
             <button
               onClick={capturePhoto}
-              className="w-20 h-20 bg-white rounded-full border-4 border-gray-300 active:scale-95 transition-transform flex items-center justify-center"
+              className="w-20 h-20 bg-white rounded-full border-4 border-gray-300 active:scale-95 transition-transform flex items-center justify-center shadow-[0_0_30px_rgba(255,255,255,0.3)]"
             >
               <div className="w-18 h-18 border-2 border-black rounded-full"></div>
             </button>
@@ -470,20 +513,22 @@ export default function App() {
             {previewUrl && (
               <img
                 src={previewUrl}
-                className="max-w-full border border-gray-700"
+                className="max-w-full border border-gray-700 shadow-2xl"
                 alt="Preview"
               />
             )}
 
-            <div className="absolute top-4 left-4 bg-black/60 backdrop-blur p-2 rounded text-[10px] text-white space-y-1 border border-white/10">
-              <div className="flex items-center gap-2">
-                <div className="w-3 h-3 bg-green-500 rounded-full"></div>{" "}
-                Deteksi Dinamis OK
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="w-3 h-3 bg-red-500 rounded-full"></div> Mode
-                Statis (Fallback)
-              </div>
+            {/* Status Indicator */}
+            <div className="absolute top-4 left-4 space-y-1">
+              {detectedRows.length >= 10 ? (
+                <div className="flex items-center gap-2 bg-green-500/90 text-white px-3 py-1 rounded-full text-[10px] font-bold shadow backdrop-blur">
+                  <CheckCircle2 className="w-3 h-3" /> LJK Terdeteksi (Dinamis)
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 bg-red-500/90 text-white px-3 py-1 rounded-full text-[10px] font-bold shadow backdrop-blur">
+                  <XCircle className="w-3 h-3" /> Mode Fallback (Statis)
+                </div>
+              )}
             </div>
 
             {isProcessing && (
@@ -494,32 +539,66 @@ export default function App() {
             )}
           </div>
 
-          <div className="bg-gray-800 p-4 border-t border-gray-700">
-            <div className="flex items-center gap-3 mb-2">
-              <span className="text-xs text-gray-300 font-bold flex-1">
-                Gelap/Terang (Threshold: {filters.threshold})
-              </span>
+          {/* FILTER CONTROLS */}
+          <div className="bg-gray-800 p-4 border-t border-gray-700 space-y-4">
+            {/* Filter Toggle */}
+            <div className="flex bg-gray-700 p-1 rounded-lg">
               <button
-                onClick={() => setShowDebugOverlay(!showDebugOverlay)}
-                className="text-gray-400 hover:text-white"
+                onClick={() => setFilterMode("magic")}
+                className={`flex-1 py-2 rounded-md text-xs font-bold flex items-center justify-center gap-2 transition ${
+                  filterMode === "magic"
+                    ? "bg-indigo-600 text-white shadow"
+                    : "text-gray-400"
+                }`}
               >
-                <Eye className="w-4 h-4" />
+                <Wand2 className="w-3 h-3" /> Magic Enhance
+              </button>
+              <button
+                onClick={() => setFilterMode("manual")}
+                className={`flex-1 py-2 rounded-md text-xs font-bold flex items-center justify-center gap-2 transition ${
+                  filterMode === "manual"
+                    ? "bg-gray-600 text-white shadow"
+                    : "text-gray-400"
+                }`}
+              >
+                <SlidersHorizontal className="w-3 h-3" /> Manual
               </button>
             </div>
-            <input
-              type="range"
-              min="50"
-              max="200"
-              value={filters.threshold}
-              onChange={(e) =>
-                setFilters((f) => ({ ...f, threshold: Number(e.target.value) }))
-              }
-              className="w-full h-4 bg-gray-600 rounded-lg accent-indigo-500 cursor-pointer mb-4"
-            />
+
+            {/* Manual Slider */}
+            {filterMode === "manual" && (
+              <div className="space-y-1 animate-in fade-in">
+                <div className="flex justify-between text-[10px] text-gray-400">
+                  <span>Gelap</span>
+                  <span>Threshold: {filters.threshold}</span>
+                  <span>Terang</span>
+                </div>
+                <input
+                  type="range"
+                  min="50"
+                  max="200"
+                  value={filters.threshold}
+                  onChange={(e) =>
+                    setFilters((f) => ({
+                      ...f,
+                      threshold: Number(e.target.value),
+                    }))
+                  }
+                  className="w-full h-2 bg-gray-600 rounded-lg accent-indigo-500 cursor-pointer"
+                />
+              </div>
+            )}
+
+            {filterMode === "magic" && (
+              <p className="text-[10px] text-gray-400 text-center">
+                Mode Magic otomatis membersihkan bayangan dan mempertajam tanda
+                LJK agar Garis Hijau muncul.
+              </p>
+            )}
 
             <button
               onClick={processScan}
-              className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold flex justify-center items-center gap-2 shadow-lg"
+              className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold flex justify-center items-center gap-2 shadow-lg transition active:scale-95"
             >
               <Check className="w-5 h-5" /> Proses Jawaban
             </button>
@@ -533,7 +612,7 @@ export default function App() {
         <div className="flex items-center gap-2 font-bold text-indigo-800">
           <ScanLine /> LJK Pro{" "}
           <span className="text-xs bg-indigo-100 text-indigo-600 px-1 rounded">
-            v5 Fixed
+            Enhance
           </span>
         </div>
         <div className="text-xs text-gray-500">{history.length} Data</div>
@@ -559,13 +638,12 @@ export default function App() {
           <div className="grid grid-cols-1 gap-3">
             <button
               onClick={startCamera}
-              className="bg-indigo-600 text-white p-6 rounded-xl shadow-lg shadow-indigo-200 hover:bg-indigo-700 transition flex flex-col items-center gap-2"
+              className="bg-indigo-600 text-white p-6 rounded-xl shadow-lg shadow-indigo-200 hover:bg-indigo-700 transition flex flex-col items-center gap-2 group"
             >
-              <Camera className="w-8 h-8" />
+              <div className="p-3 bg-white/10 rounded-full group-hover:scale-110 transition">
+                <Camera className="w-8 h-8" />
+              </div>
               <span className="font-bold">Buka Kamera</span>
-              <span className="text-[10px] opacity-70">
-                Tap layar untuk fokus
-              </span>
             </button>
             <button
               onClick={() => uploadInputRef.current.click()}
@@ -596,7 +674,11 @@ export default function App() {
           <div className="bg-white p-4 rounded-lg shadow border space-y-4">
             <div className="flex justify-between items-center border-b pb-2">
               <h2 className="font-bold text-lg text-gray-800">Hasil</h2>
-              <div className="text-2xl font-bold text-indigo-600">
+              <div
+                className={`text-2xl font-bold ${
+                  currentScore >= 75 ? "text-green-600" : "text-red-600"
+                }`}
+              >
                 {currentScore}
               </div>
             </div>
@@ -668,6 +750,7 @@ export default function App() {
           </div>
         )}
 
+        {/* ... Key & History Section (No Changes) ... */}
         {mode === "key" && (
           <div className="bg-white p-4 rounded shadow border">
             <div className="flex justify-between mb-4">
